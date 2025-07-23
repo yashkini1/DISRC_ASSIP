@@ -1,0 +1,513 @@
+import gymnasium as gym
+import numpy as np
+from collections import deque, namedtuple
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from PIL import Image # Required for saving GIF
+import time # For visualization delay
+import torch.nn.functional as F # ADDED: Import torch.nn.functional as F
+
+# ===============================
+# Reproducibility
+# ===============================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# ===============================
+# Utility Functions
+# ===============================
+def ensure_2d_tensor(tensor):
+    """Ensure input is a 2D torch tensor (batch dimension)."""
+    if isinstance(tensor, np.ndarray):
+        tensor = torch.FloatTensor(tensor)
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+def init_weights(m):
+    """Initializes weights using Xavier uniform and biases to zeros for Linear layers."""
+    if isinstance(m, nn.Linear):
+        nn.init.xavier_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+def smooth_curve(data, w=0.9):
+    """Exponential moving average smoothing for plotting."""
+    if not data:
+        return []
+    smoothed = []
+    last = data[0]
+    for x in data:
+        last = last * w + (1 - w) * x
+        smoothed.append(last)
+    return smoothed
+
+# ===============================
+# DISRC Controller
+# ===============================
+class DISRCController:
+    """
+    Dynamic Internal State Replay Conditioning (DISRC) Controller.
+    Computes a bonus based on the deviation of the encoded state from a learned setpoint.
+    """
+    def __init__(self, state_dim, alpha=0.03, beta_start=0.04):
+        self.state_dim = state_dim
+        self.alpha = alpha # Learning rate for the setpoint
+        self.beta_start = beta_start # Initial bonus scaling factor
+        self.setpoint = np.zeros(state_dim, dtype=np.float32) # The learned setpoint
+
+    def compute_bonus(self, encoded_state, episode_ratio):
+        """
+        Computes the bonus reward based on encoded state deviation and updates the setpoint.
+        Args:
+            encoded_state (torch.Tensor): The current encoded state from the encoder.
+            episode_ratio (float): Current episode number / total number of episodes.
+        Returns:
+            float: The computed bonus reward.
+        """
+        s_np = encoded_state.detach().cpu().numpy().squeeze()
+        # Normalize the encoded state and setpoint for deviation calculation
+        s_norm = s_np / (np.linalg.norm(s_np) + 1e-8)
+        sp_norm = self.setpoint / (np.linalg.norm(self.setpoint) + 1e-8)
+        
+        deviation = np.linalg.norm(s_norm - sp_norm)
+        
+        # Bonus decays gently over time, encouraging exploration early
+        beta = self.beta_start * (1.0 - episode_ratio ** 1.2)
+        bonus = -beta * deviation # Negative bonus for deviation
+
+        # Update the setpoint using an exponential moving average
+        self.setpoint = (1.0 - self.alpha) * self.setpoint + self.alpha * s_np
+        return bonus
+
+# ===============================
+# Replay Buffer
+# ===============================
+class ReplayBuffer:
+    """Fixed-size buffer to store experience tuples."""
+    def __init__(self, action_size, buffer_size, batch_size, seed):
+        self.action_size = action_size
+        self.memory = deque(maxlen=buffer_size)
+        self.batch_size = batch_size
+        self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
+        self.seed = random.seed(seed)
+
+    def add(self, state, action, reward, next_state, done):
+        """Add a new experience to memory."""
+        e = self.experience(state, action, reward, next_state, done)
+        self.memory.append(e)
+
+    def sample(self):
+        """Randomly sample a batch of experiences from memory."""
+        experiences = random.sample(self.memory, k=self.batch_size)
+
+        # Convert lists of numpy arrays to stacked torch tensors
+        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(device)
+        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
+        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+
+        return (states, actions, rewards, next_states, dones)
+
+    def __len__(self):
+        """Return the current size of internal memory."""
+        return len(self.memory)
+
+# ===============================
+# Models with LayerNorm
+# ===============================
+class DISRCStateEncoder(nn.Module):
+    """
+    State Encoder for DISRC. Encodes raw environment state into a lower-dimensional representation.
+    Uses LayerNormalization for improved training stability.
+    """
+    def __init__(self, input_dim=4, encoded_dim=4):
+        super().__init__()
+        self._encoded_dim = encoded_dim # Stored internally
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Linear(32, encoded_dim) # Final layer, no activation here (linear output)
+        )
+    
+    @property
+    def encoded_dim(self):
+        """Returns the dimension of the encoded state."""
+        return self._encoded_dim
+
+    def forward(self, x):
+        return self.encoder(x)
+
+class DISRC_DQN(nn.Module):
+    """
+    Deep Q-Network for DISRC.
+    Uses LayerNormalization for improved training stability.
+    """
+    def __init__(self, input_size, action_size, device): # Added device parameter
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, action_size) # Final layer, no activation here (linear output)
+        )
+        self.to(device) # Move model to device
+
+    def forward(self, x):
+        return self.net(x)
+
+# ===============================
+# Epsilon Greedy
+# ===============================
+def epsilon_greedy(model, state, epsilon, action_space):
+    """
+    Epsilon-greedy action selection.
+    Args:
+        model (nn.Module): The Q-network (local).
+        state (torch.Tensor): The current encoded state.
+        epsilon (float): The current exploration rate.
+        action_space (int): The number of possible actions.
+    Returns:
+        int: The selected action.
+    """
+    if random.random() < epsilon:
+        return random.randrange(action_space)
+    with torch.no_grad():
+        q_values = model(state)
+        return torch.argmax(q_values).item()
+
+# ===============================
+# Soft update
+# ===============================
+def soft_update(target, source, tau=0.005):
+    """
+    Soft updates target network parameters towards local network parameters.
+    θ_target = τ*θ_local + (1 - τ)*θ_target
+    """
+    for tp, p in zip(target.parameters(), source.parameters()):
+        tp.data.copy_(tau * p.data + (1.0 - tau) * tp.data)
+
+# ===============================
+# DQNAgent Class
+# ===============================
+class DQNAgent:
+    """Interacts with and learns from the environment."""
+    def __init__(self, state_size, action_size, seed, lr, gamma=0.99, tau=0.005, buffer_size=int(1e5), batch_size=128, device=None):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.seed = random.seed(seed)
+        self.device = device # Store device
+
+        # DISRC Components
+        self.encoder = DISRCStateEncoder(input_dim=state_size, encoded_dim=4).to(device)
+        self.disrc_controller = DISRCController(state_dim=self.encoder.encoded_dim, alpha=0.03, beta_start=0.04)
+
+        # Main Q-Networks (DISRC_DQN architecture)
+        self.qnetwork_local = DISRC_DQN(input_size=self.encoder.encoded_dim, action_size=action_size, device=device).to(device)
+        self.qnetwork_target = DISRC_DQN(input_size=self.encoder.encoded_dim, action_size=action_size, device=device).to(device)
+        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+        self.qnetwork_target.eval() # Target network should be in evaluation mode
+
+        # Optimizers for all networks
+        self.optimizer_q = optim.Adam(self.qnetwork_local.parameters(), lr=lr)
+        self.optimizer_encoder = optim.Adam(self.encoder.parameters(), lr=3e-4)
+        
+        self.memory = ReplayBuffer(action_size, buffer_size, batch_size, seed)
+        self.t_step = 0 # For controlling learning frequency
+        self.gamma = gamma
+        self.tau = tau # For soft update
+
+        self.losses_history = [] # To track losses over time
+        self.reward_norm = 1.0 # For reward normalization
+
+        # Apply Xavier uniform initialization to all networks
+        self.encoder.apply(init_weights)
+        self.qnetwork_local.apply(init_weights)
+        self.qnetwork_target.apply(init_weights)
+
+
+    def step(self, state, action, reward, next_state, done, episode, num_episodes):
+        # Reward shaping with DISRC bonus
+        self.reward_norm = 0.99 * self.reward_norm + 0.01 * abs(reward)
+        normed_reward = reward / (self.reward_norm + 1e-8)
+        
+        # Compute DISRC bonus
+        # Need to encode state here to compute bonus before adding to buffer
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        encoded_state = self.encoder(state_tensor)
+        bonus = self.disrc_controller.compute_bonus(encoded_state, episode / num_episodes)
+        
+        shaped_reward = np.clip(normed_reward + 0.2 * bonus, -1.0, 1.0)
+
+        # Add experience to replay buffer (using shaped_reward)
+        self.memory.add(state, action, shaped_reward, next_state, done)
+
+        # Learn every 4 steps (update_frequency)
+        self.t_step = (self.t_step + 1) % 4
+        if self.t_step == 0:
+            # If enough samples are available in memory, get random subset and learn
+            if len(self.memory) > self.memory.batch_size:
+                experiences = self.memory.sample()
+                loss_item = self.learn(experiences, self.gamma)
+                self.losses_history.append(loss_item) # Store the loss
+
+    def act(self, state, eps=0.):
+        # Encode the raw state before feeding to Q-network
+        state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+        encoded_state = self.encoder(state_tensor) # Pass through encoder
+
+        self.qnetwork_local.eval() # Set local network to evaluation mode for action selection
+        with torch.no_grad():
+            action_values = self.qnetwork_local(encoded_state) # Use encoded state
+        self.qnetwork_local.train() # Set local network back to training mode
+
+        # Epsilon-greedy action selection
+        if random.random() > eps:
+            return action_values.argmax(dim=1).item()
+        else:
+            return random.randrange(self.action_size)
+
+    def learn(self, experiences, gamma):
+        states, actions, rewards, next_states, dones = experiences # Already tensors from ReplayBuffer.sample()
+
+        # Encode states and next_states for Q-network inputs
+        s_enc = self.encoder(states)
+        ns_enc = self.encoder(next_states)
+
+        # Get max predicted Q values (for next states) from target model (Double DQN style)
+        Q_targets_next_local = self.qnetwork_local(ns_enc).detach().argmax(1).unsqueeze(1) # Action from local
+        Q_targets_next = self.qnetwork_target(ns_enc).detach().gather(1, Q_targets_next_local).squeeze(1) # Q-value from target
+
+        # Compute Q targets for current states
+        # FIX: Squeeze rewards and dones to match Q_targets_next shape
+        Q_targets = rewards.squeeze(1) + (gamma * Q_targets_next * (1 - dones.squeeze(1)))
+
+        # Get expected Q values from local model
+        Q_expected = self.qnetwork_local(s_enc).gather(1, actions).squeeze(1)
+
+        # Compute loss (MSE)
+        loss = F.mse_loss(Q_expected, Q_targets) # F is used here
+
+        # Optimize networks
+        self.optimizer_q.zero_grad()
+        self.optimizer_encoder.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), max_norm=0.3)
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=0.3)
+        
+        self.optimizer_q.step()
+        self.optimizer_encoder.step()
+        
+        # Soft update target network
+        soft_update(self.qnetwork_target, self.qnetwork_local, self.tau)
+
+        return loss.item() # Return scalar loss for logging
+
+# ===============================
+# Main Training and Evaluation Function
+# ===============================
+def train_and_evaluate_dqn(env, agent, num_episodes, max_steps_per_episode,
+                           epsilon_start, epsilon_end, epsilon_decay_rate,
+                           update_frequency, device):
+    rewards_per_episode = []
+    smoothed_rewards = []
+
+    for episode in range(num_episodes):
+        state, _ = env.reset(seed=SEED) # Reset environment, get initial state
+        episode_reward = 0
+        done = False
+        truncated = False
+
+        # Epsilon decay
+        epsilon = max(epsilon_end, epsilon_start * (epsilon_decay_rate ** episode))
+
+        for step in range(max_steps_per_episode):
+            # Render the environment
+            env.render()
+            time.sleep(0.01) # Small delay to make visualization smoother
+
+            # Choose and perform an action
+            action = agent.act(state, epsilon)
+            next_state, reward, done, truncated, _ = env.step(action) # env.step returns 5 values
+
+            # Agent takes a step, adds to memory, and potentially learns
+            agent.step(state, action, reward, next_state, done or truncated, episode, num_episodes) # Pass episode info for DISRC
+
+            episode_reward += reward
+            state = next_state
+
+            if done or truncated:
+                break
+
+        rewards_per_episode.append(episode_reward)
+        smoothed_rewards.append(smooth_curve(rewards_per_episode)[-1]) # Get the latest smoothed value
+
+        # Print progress
+        if (episode + 1) % update_frequency == 0:
+            print(f"Episode {episode + 1}/{num_episodes} | Epsilon: {epsilon:.4f} | Current Reward: {episode_reward:.2f} | Smoothed Reward: {smoothed_rewards[-1]:.2f}")
+
+    env.close() # Close environment after training
+    return rewards_per_episode, agent.losses_history # Return actual losses history
+
+# ===============================
+# Main Execution
+# ===============================
+def main():
+    # Initialize the environment
+    env = gym.make("CartPole-v1", render_mode="human") # Enable human rendering
+
+    # Get environment dimensions
+    state_dim = env.observation_space.shape[0]
+    action_size = env.action_space.n
+
+    # Check if GPU is available and set device
+    global device # Ensure device is accessible globally for models
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Set seeds for reproducibility
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Training parameters
+    num_episodes = 250 # As requested
+    max_steps_per_episode = 500 # CartPole-v1 max steps
+    epsilon_start = 1.0
+    epsilon_end = 0.01 # A lower epsilon_end for better exploitation
+    epsilon_decay_rate = 0.995 # Adjusted for 250 episodes
+    gamma = 0.99 # Discount factor
+    lr = 0.0005 # Learning rate for main Q-network
+    buffer_size = int(1e5) # Replay buffer size
+    batch_size = 128 # Batch size for learning
+    update_frequency = 10 # Print frequency
+
+    # Initialize the DQNAgent with DISRC components
+    agent = DQNAgent(state_dim, action_size, seed=SEED, lr=lr,
+                     gamma=gamma, buffer_size=buffer_size, batch_size=batch_size, device=device)
+
+    print(f"Starting training for CartPole-v1 with DISRC DQN...")
+    print(f"Episodes: {num_episodes}, Gamma: {gamma}, LR (DQN): {lr}, Batch Size: {batch_size}")
+    print(f"Epsilon: Start={epsilon_start}, End={epsilon_end}, Decay Rate={epsilon_decay_rate}")
+
+    # Train the agent
+    rewards, losses = train_and_evaluate_dqn(env, agent, num_episodes, max_steps_per_episode,
+                                        epsilon_start, epsilon_end, epsilon_decay_rate,
+                                        update_frequency, device)
+
+    # Plotting training results
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(rewards, label="Raw Reward", color='royalblue', alpha=0.4)
+    plt.plot(smooth_curve(rewards), label="Smoothed Reward", color='dodgerblue')
+    plt.title("Episode Rewards Over Time", fontsize=14)
+    plt.xlabel("Episode", fontsize=12); plt.ylabel("Total Reward", fontsize=12)
+    plt.legend(); plt.grid(alpha=0.3)
+
+    plt.subplot(1, 2, 2)
+    if losses:
+        plt.plot(losses, label="Mini-Batch Loss", color='darkorange')
+    else:
+        plt.text(0.5, 0.5, "No loss data to plot", horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes)
+    plt.title("Mini-Batch Loss During Training", fontsize=14)
+    plt.xlabel("Training Step (Batch)", fontsize=12); plt.ylabel("Loss", fontsize=12)
+    plt.legend(); plt.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    # --- Evaluation ---
+    print("\n--- Evaluating Trained Agent ---")
+    test_episodes = 100
+    episode_rewards_test = []
+    test_env = gym.make("CartPole-v1") # Create a new env for evaluation without rendering overhead
+
+    for episode in range(test_episodes):
+        state, _ = test_env.reset(seed=SEED)
+        episode_reward = 0
+        done = False
+        truncated = False
+
+        while not done and not truncated:
+            action = agent.act(state, eps=0.) # No exploration during testing
+            next_state, reward, done, truncated, _ = test_env.step(action)
+            episode_reward += reward
+            state = next_state
+        episode_rewards_test.append(episode_reward)
+
+    test_env.close()
+    average_reward = sum(episode_rewards_test) / test_episodes
+    print(f"Average reward over {test_episodes} test episodes: {average_reward:.2f}")
+    if average_reward >= 195: # CartPole-v1 is considered solved at 195+ over 100 episodes
+        print("CartPole-v1 is considered SOLVED!")
+    elif average_reward >= 100:
+        print("Agent is performing well!")
+    else:
+        print("Agent performance needs more improvement.")
+
+
+    # --- Visualization of a single trained episode and GIF saving ---
+    print("\n--- Visualizing a Trained Agent's Episode and Saving GIF ---")
+    visualize_env = gym.make("CartPole-v1", render_mode="rgb_array") # Use rgb_array for GIF frames
+    frames = []
+    state, _ = visualize_env.reset(seed=SEED)
+    done = False
+    truncated = False
+    total_viz_reward = 0
+
+    while not done and not truncated:
+        frames.append(visualize_env.render()) # Collect frame
+        action = agent.act(state, eps=0.) # No exploration during visualization
+        next_state, reward, done, truncated, _ = visualize_env.step(action)
+        total_viz_reward += reward
+        state = next_state
+
+    visualize_env.close()
+    print(f"Visualization episode finished with total reward: {total_viz_reward:.2f}")
+
+    # Save GIF
+    if frames:
+        # Create a directory for gifs if it doesn't exist
+        import os
+        gif_dir = "cartpole_gifs"
+        os.makedirs(gif_dir, exist_ok=True)
+        gif_path = os.path.join(gif_dir, "cartpole_disrc_dqn_trained.gif")
+        
+        # Convert frames to PIL Images and save as GIF
+        # PIL.Image.fromarray(frame) expects (H, W, C)
+        # frames[0] is used to set duration and loop for the whole GIF
+        Image.fromarray(frames[0]).save(
+            gif_path,
+            save_all=True,
+            append_images=[Image.fromarray(f) for f in frames[1:]],
+            duration=50, # Milliseconds per frame
+            loop=0 # Loop forever
+        )
+        print(f"GIF saved to: {gif_path}")
+    else:
+        print("No frames collected for GIF saving.")
+
+
+if __name__ == "__main__":
+    main()
