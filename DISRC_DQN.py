@@ -310,6 +310,22 @@ def main():
     plt.savefig("DISRC_training_results.png")
     plt.show()
     print("Plot saved as 'DISRC_training_results.png'")
+    
+    # Evaluate trained agent
+    test_episodes = 100
+    scores = []
+    for _ in range(test_episodes):
+        s, _ = env.reset(seed=SEED)
+        done, truncated, ep_r = False, False, 0
+        while not done and not truncated:
+            s_t = torch.FloatTensor(s).unsqueeze(0)
+            # epsilon=0.0 means pure exploitation
+            a = epsilon_greedy(model, s_t, epsilon=0.0, action_space=env.action_space.n)
+            s, r, done, truncated, _ = env.step(a)
+            ep_r += r
+        scores.append(ep_r)
+    print(f"Average Test Reward over {test_episodes} episodes: {np.mean(scores):.2f}")
+
 
 if __name__ == "__main__":
     main()
