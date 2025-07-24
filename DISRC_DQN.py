@@ -278,6 +278,52 @@ def main():
     rewards, losses = train_dqn(env, model, target_model, encoder,
                                 encoder_optimizer, model_optimizer,
                                 disrc_controller)
+    
+    # ================================
+    # Metrics Computation for Research
+    # ================================
+
+    # Number of episodes trained
+    num_eps = len(rewards)
+
+    # Mean reward in final 100 episodes
+    final_window = 100
+    final_rewards = rewards[-final_window:]
+    mean_final_reward = np.mean(final_rewards)
+
+    # Episodes to first cross 200‑reward threshold
+    threshold = 200
+    episodes_to_threshold = None
+    for idx, r in enumerate(rewards):
+        if r >= threshold:
+            episodes_to_threshold = idx + 1  # +1 because idx is zero-based
+            break
+    if episodes_to_threshold is None:
+        episodes_to_threshold = num_eps  # never crossed
+
+    # Total interactions (assuming CartPole-v1 max 500 steps)
+    max_steps_per_episode = 500
+    total_interactions = num_eps * max_steps_per_episode
+    interactions_to_threshold = episodes_to_threshold * max_steps_per_episode
+
+    # Loss variance (over all collected losses)
+    loss_variance = float(np.var(losses)) if losses else 0.0
+
+    # Reward deviation (standard deviation of episode rewards)
+    reward_deviation = float(np.std(rewards))
+
+    # Area under the reward curve (simple sum over episodes)
+    auc_reward = float(np.trapz(rewards, dx=1))
+
+    # Print all metrics
+    print("===== METRICS =====")
+    print(f"Mean reward in final {final_window} episodes: {mean_final_reward:.2f}")
+    print(f"Episodes to first reach {threshold} reward: {episodes_to_threshold}")
+    print(f"Env interactions to reach threshold: {interactions_to_threshold}")
+    print(f"Loss variance: {loss_variance:.6f}")
+    print(f"Reward standard deviation: {reward_deviation:.2f}")
+    print(f"Area under reward curve: {auc_reward:.2f}")
+    print("===================")
 
     # helper function for smoothing
     def smooth(data, w=0.9):
